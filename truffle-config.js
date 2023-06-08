@@ -1,0 +1,1 @@
+plugins: ["truffle-contract-size"];
