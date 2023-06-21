@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-pragma solidity ^0.8.17;
+pragma solidity 0.8.17;
 
 import "./EUSD.sol";
 import "./Governable.sol";
-import "hardhat/console.sol";
 
 interface Ilido {
     function submit(address _referral) external payable returns (uint256 StETH);
@@ -195,17 +194,12 @@ contract Lybra is EUSD, Governable {
         require(onBehalfOf != address(0), "DEPOSIT_TO_THE_ZERO_ADDRESS");
         require(msg.value >= 1 ether, "Deposit should not be less than 1 ETH.");
 
-        console.log("before lido.submit");
         //convert to steth
         uint256 sharesAmount = lido.submit{value: msg.value}(gov);
         require(sharesAmount > 0, "ZERO_DEPOSIT");
 
-        console.log("after lido.submit");
-
         totalDepositedEther += msg.value;
         depositedEther[onBehalfOf] += msg.value;
-
-        console.log("after + msg.value");
 
         if (mintAmount > 0) {
             _mintEUSD(onBehalfOf, onBehalfOf, mintAmount);
@@ -296,7 +290,63 @@ contract Lybra is EUSD, Governable {
         _repay(msg.sender, onBehalfOf, amount);
     }
 
- 
+    /**
+     * @notice When overallCollateralRate is above 150%, Keeper liquidates borrowers whose collateral rate is below badCollateralRate, using EUSD provided by Liquidation Provider.
+     *
+     * Requirements:
+     * - onBehalfOf Collateral Rate should be below badCollateralRate
+     * - etherAmount should be less than 50% of collateral
+     * - provider should authorize Lybra to utilize EUSD
+     * @dev After liquidation, borrower's debt is reduced by etherAmount * etherPrice, collateral is reduced by the etherAmount corresponding to 110% of the value. Keeper gets keeperRate / 110 of Liquidation Reward and Liquidator gets the remaining stETH.
+     */
+    function liquidation(
+        address provider,
+        address onBehalfOf,
+        uint256 etherAmount
+    ) external {
+        uint256 etherPrice = _etherPrice();
+        uint256 onBehalfOfCollateralRate = (depositedEther[onBehalfOf] *
+            etherPrice *
+            100) / borrowed[onBehalfOf];
+        require(
+            onBehalfOfCollateralRate < badCollateralRate,
+            "Borrowers collateral rate should below badCollateralRate"
+        );
+
+        require(
+            etherAmount * 2 <= depositedEther[onBehalfOf],
+            "a max of 50% collateral can be liquidated"
+        );
+        uint256 eusdAmount = (etherAmount * etherPrice) / 1e18;
+        require(
+            allowance(provider, address(this)) >= eusdAmount,
+            "provider should authorize to provide liquidation EUSD"
+        );
+
+        _repay(provider, onBehalfOf, eusdAmount);
+        uint256 reducedEther = (etherAmount * 11) / 10;
+        totalDepositedEther -= reducedEther;
+        depositedEther[onBehalfOf] -= reducedEther;
+        uint256 reward2keeper;
+        if (provider == msg.sender) {
+            lido.transfer(msg.sender, reducedEther);
+        } else {
+            reward2keeper = (reducedEther * keeperRate) / 110;
+            lido.transfer(provider, reducedEther - reward2keeper);
+            lido.transfer(msg.sender, reward2keeper);
+        }
+        emit LiquidationRecord(
+            provider,
+            msg.sender,
+            onBehalfOf,
+            eusdAmount,
+            reducedEther,
+            reward2keeper,
+            false,
+            block.timestamp
+        );
+    }
+
     /**
      * @notice When overallCollateralRate is below badCollateralRate, borrowers with collateralRate below 125% could be fully liquidated.
      * Emits a `LiquidationRecord` event.
@@ -518,7 +568,7 @@ contract Lybra is EUSD, Governable {
     /**
      * @dev Get USD value of current collateral asset and minted EUSD through price oracle / Collateral asset USD value must higher than safe Collateral Rate.
      */
-    function _checkHealth(address user) public {
+    function _checkHealth(address user) internal {
         if (
             ((depositedEther[user] * _etherPrice() * 100) / borrowed[user]) <
             safeCollateralRate
@@ -548,5 +598,13 @@ contract Lybra is EUSD, Governable {
      */
     function _getTotalMintedEUSD() internal view override returns (uint256) {
         return totalEUSDCirculation;
+    }
+
+    function getBorrowedOf(address user) external view returns (uint256) {
+        return borrowed[user];
+    }
+
+    function isRedemptionProvider(address user) external view returns (bool) {
+        return redemptionProvider[user];
     }
 }
